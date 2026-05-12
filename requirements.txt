@@ -1,0 +1,8 @@
+streamlit
+requests
+folium
+streamlit-folium
+streamlit-geolocation
+pandas
+scikit-learn
+matplotlib
