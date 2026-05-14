@@ -1,6 +1,5 @@
 import streamlit as st
 import requests
-import math
 import re
 from datetime import datetime
 import folium
@@ -11,6 +10,7 @@ from sklearn.neighbors import KNeighborsClassifier
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
+from geopy.distance import geodesic
 
 # ─── Seitenkonfiguration ──────────────────────────────────────────────────────
 st.set_page_config(page_title="🫀 AED-Finder Schweiz", page_icon="🫀", layout="wide")
@@ -97,23 +97,9 @@ class AED:
 # ─── Hilfsfunktionen ──────────────────────────────────────────────────────────
 
 # Berechnet die Luftlinie zwischen zwei GPS-Punkten in Metern.
-# Normale Pythagoras-Formel funktioniert hier nicht, weil die Erde rund ist –
-# deshalb brauchen wir die Haversine-Formel, die die Erdkrümmung einbezieht.
+# geopy.geodesic nutzt das WGS-84-Ellipsoid – präziser als eine einfache Kugelformel.
 def berechne_distanz(lat1, lon1, lat2, lon2):
-    erdradius = 6371000  # Erdradius in Metern (grober Durchschnittswert)
-
-    # GPS-Koordinaten sind in Grad angegeben, math.sin/cos brauchen aber Bogenmass
-    lat1_rad = math.radians(lat1)
-    lat2_rad = math.radians(lat2)
-    delta_lat = math.radians(lat2 - lat1)
-    delta_lon = math.radians(lon2 - lon1)
-
-    # Kernformel: berechnet den Zentralwinkel zwischen den beiden Punkten
-    a = math.sin(delta_lat / 2) ** 2 + math.cos(lat1_rad) * math.cos(lat2_rad) * math.sin(delta_lon / 2) ** 2
-
-    # Aus dem Winkel die Strecke auf der Kugeloberfläche berechnen
-    distanz = erdradius * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-    return distanz
+    return geodesic((lat1, lon1), (lat2, lon2)).meters
 
 
 # Prüft ob ein AED gerade zugänglich ist, und ob das auch wirklich bestätigt ist.
@@ -170,8 +156,8 @@ def pruefe_oeffnungszeiten(oeffnungszeiten):
         if tag_von <= wochentag <= tag_bis and oeffnung_min <= aktuelle_minuten <= schliessung_min:
             return True, True  # Zeitfenster passt → bestätigt offen
 
-    # Zeitangabe vorhanden, aber gerade nicht im Fenster → trotzdem "offen" annehmen, nicht bestätigt
-    return True, False
+    # Zeitangabe vorhanden, kein passendes Fenster → bestätigt geschlossen
+    return False, True
 
 
 # Liest AED-Einträge aus einer GeoJSON-Antwort aus und gibt eine Liste von AED-Objekten zurück.
@@ -251,7 +237,7 @@ def _aed_zu_features(aed):
         "distanz_m":        aed.distanz_m or 0,
         "ist_24h":          1 if aed.ist_24h() else 0,
         "ist_offen":        1 if aed.ist_offen else 0,
-        "bestätigt_offen":  1 if aed.bestaetigt else 0,
+        "zugänglichkeit_bekannt":  1 if aed.bestaetigt else 0,
         "hat_adresse":      1 if (_text_vorhanden(aed.strasse) or _text_vorhanden(aed.ort)) else 0,
         "hat_standorttext": _text_vorhanden(aed.standort_beschreibung),
         "hat_telefon":      _text_vorhanden(aed.telefon),
@@ -260,17 +246,29 @@ def _aed_zu_features(aed):
 
 
 def _empfehlungs_label(row):
-    """Weist jedem AED ein Label zu, das später als Trainings-Zielwert dient."""
-    if row["bestätigt_offen"] == 1 and row["distanz_m"] <= 500:
+    """Weist jedem AED ein Label zu, das später als Trainings-Zielwert dient.
+
+    Kriterien (Kombination aus Distanz + Zugänglichkeit):
+      Sehr empfohlen : Zugänglichkeit bekannt UND offen UND ≤ 500 m
+      Empfohlen      : offen UND ≤ 1000 m
+      Nur wenn nötig : weit weg (> 1000 m) ODER Zugänglichkeit unklar/geschlossen
+    """
+    bekannt = row["zugänglichkeit_bekannt"] == 1
+    offen   = row["ist_offen"] == 1
+    ist_24h = row["ist_24h"] == 1
+    distanz = row["distanz_m"]
+
+    # 24/7 zählt als bestätigt offen
+    if (ist_24h or (bekannt and offen)) and distanz <= 500:
         return "Sehr empfohlen"
-    elif row["ist_offen"] == 1 and row["distanz_m"] <= 1000:
+    elif (ist_24h or offen) and distanz <= 1000:
         return "Empfohlen"
     else:
         return "Nur wenn nötig"
 
 
 FEATURE_SPALTEN = [
-    "distanz_m", "ist_24h", "ist_offen", "bestätigt_offen",
+    "distanz_m", "ist_24h", "ist_offen", "zugänglichkeit_bekannt",
     "hat_adresse", "hat_standorttext", "hat_telefon", "hat_stockwerk",
 ]
 
